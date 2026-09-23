@@ -183,14 +183,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
-import {
-  loadPdfDocument, renderPageToCanvas, buildTextLayer,
-  buildAnnotationLayer, preloadPdfjs, getPageBaseDimensions,
-  searchDocument, buildHighlightLayer, clearHighlightLayer,
-  type PdfjsDocument, type PdfjsPage, type PdfjsViewport,
-  type SearchResult, type SearchMatch, type PageSearchResult,
-} from '@/utils/pdf-engine'
+import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { loadPdfDocument, preloadPdfjs, type PdfjsDocument } from '@/utils/pdf-engine'
+import { usePageRegistry } from '@/composables/usePageRegistry'
+import { usePageLayout } from '@/composables/usePageLayout'
+import { usePageRecycler } from '@/composables/usePageRecycler'
+import { useRenderQueue } from '@/composables/useRenderQueue'
+import { useScrollSpy } from '@/composables/useScrollSpy'
+import { useDocumentSearch } from '@/composables/useDocumentSearch'
 
 const sampleFiles = [
   { name: 'sample.pdf', label: '示例一：学术论文' },
@@ -198,458 +198,93 @@ const sampleFiles = [
   { name: 'document.pdf', label: '示例三：图文混排' },
 ]
 
-/* ---- 响应式状态 ---- */
+/* ---- 文档级响应式状态 ---- */
 const pdfDoc = ref<PdfjsDocument | null>(null)
 const totalPages = ref(0)
-const scale = ref(1.5)
 const loading = ref(false)
 const errorMsg = ref('')
 const fileName = ref('')
-const currentVisiblePage = ref(1)
 const toastMsg = ref('')
 const toastType = ref<'success' | 'error' | 'info'>('info')
 
 const containerRef = ref<HTMLElement | null>(null)
-const searchInputRef = ref<HTMLInputElement | null>(null)
 
-/* ---- 搜索相关状态 ---- */
-const searchKeyword = ref('')
-const searching = ref(false)
-const searchCancelled = ref(false)
-const searchProgress = reactive({ current: 0, total: 0 })
-const searchResult = reactive<SearchResult>({
-  keyword: '',
-  totalMatches: 0,
-  totalPages: 0,
-  pages: [],
-})
-const currentMatchIndex = ref(-1)
-const showSearchPanel = ref(false)
-const expandedPages = reactive(new Set<number>())
-const allMatches = computed<SearchMatch[]>(() => {
-  return searchResult.pages.flatMap((p) => p.matches)
-})
-
-/**
- * 每页的基础尺寸（scale=1 时的宽高），用于精确计算不同尺寸页面的布局。
- * 使用 reactive(Map) 确保 set/delete 操作触发视图更新。
- */
-const pageBaseDims = reactive(new Map<number, { baseWidth: number; baseHeight: number }>())
-
-/**
- * 每页在当前 scale 下的实际像素尺寸（响应式）。
- * getPageStyle() 依赖此 Map 驱动 template 中 .pdf-page 的宽高。
- */
-const pageDimensions = reactive(new Map<number, { width: number; height: number }>())
-
-/* ---- 非响应式内部状态（不驱动 template，无需 reactive） ---- */
-const canvasRefs = new Map<number, HTMLCanvasElement>()
-const textLayerRefs = new Map<number, HTMLDivElement>()
-const annotationLayerRefs = new Map<number, HTMLDivElement>()
-const highlightLayerRefs = new Map<number, HTMLDivElement>()
-const pageWrapperRefs = new Map<number, HTMLElement>()
-const renderedPages = new Set<string>()
-const renderedPageOrder: number[] = []
-const MAX_RENDERED = 15
+/* ---- Toast（查找模块通过回调使用，不属于查找职责） ---- */
 let toastTimer: ReturnType<typeof setTimeout> | null = null
-let renderVersion = 0
-let scrollRafId: number | null = null
-let highlightVersion = 0
-
-/* ---- Ref 绑定 ---- */
-function setCanvasRef(el: HTMLCanvasElement | null, n: number) { if (el) canvasRefs.set(n, el) }
-function setTextLayerRef(el: HTMLDivElement | null, n: number) { if (el) textLayerRefs.set(n, el) }
-function setAnnotationLayerRef(el: HTMLDivElement | null, n: number) { if (el) annotationLayerRefs.set(n, el) }
-function setHighlightLayerRef(el: HTMLDivElement | null, n: number) { if (el) highlightLayerRefs.set(n, el) }
-function setPageRef(el: HTMLElement | null, n: number) { if (el) pageWrapperRefs.set(n, el) }
-
-/* ---- Toast ---- */
 function showToast(msg: string, type: 'success' | 'error' | 'info' = 'info') {
   toastMsg.value = msg; toastType.value = type
   if (toastTimer) clearTimeout(toastTimer)
   toastTimer = setTimeout(() => { toastMsg.value = '' }, 3000)
 }
 
-/* ---- 搜索功能 ---- */
-async function startSearch() {
-  const keyword = searchKeyword.value.trim()
-  if (!keyword || !pdfDoc.value) return
+/* ---- 各职责模块（按数据流接线，模块之间不直接相互引用） ---- */
+// DOM 引用登记
+const {
+  canvasRefs, textLayerRefs, annotationLayerRefs, highlightLayerRefs, pageWrapperRefs,
+  setCanvasRef, setTextLayerRef, setAnnotationLayerRef, setHighlightLayerRef, setPageRef,
+  reset: resetRegistry,
+} = usePageRegistry()
 
-  searching.value = true
-  searchCancelled.value = false
-  searchProgress.current = 0
-  searchProgress.total = pdfDoc.value.numPages
-  currentMatchIndex.value = -1
+// 缩放与页面尺寸
+const layout = usePageLayout({ containerRef, pdfDoc })
+const {
+  scale, pageDimensions,
+  zoomIn, zoomOut, fitWidth, getPageStyle,
+  recomputeScaledDimensions, precomputePageDimensions,
+  reset: resetLayout,
+} = layout
 
-  Object.assign(searchResult, {
-    keyword,
-    totalMatches: 0,
-    totalPages: pdfDoc.value.numPages,
-    pages: [],
-  })
+// LRU 页面回收
+const recycler = usePageRecycler({
+  layers: { canvasRefs, textLayerRefs, annotationLayerRefs, highlightLayerRefs },
+  scale,
+})
 
-  clearAllHighlights()
+// 查找状态、检索流程与高亮
+const {
+  searchInputRef, searchKeyword, searching, searchCancelled, searchProgress,
+  searchResult, currentMatchIndex, showSearchPanel, expandedPages,
+  startSearch, clearSearch, refreshHighlights, isCurrentMatch,
+  nextMatch, prevMatch, jumpToMatch, togglePageGroup, highlightMatchText,
+  reset: resetSearch,
+} = useDocumentSearch({
+  pdfDoc,
+  layout,
+  highlightLayerRefs,
+  pageWrapperRefs,
+  containerRef,
+  showToast,
+})
 
-  try {
-    const result = await searchDocument(
-      pdfDoc.value,
-      keyword,
-      false,
-      (page, total) => {
-        searchProgress.current = page
-        searchProgress.total = total
-      },
-      () => searchCancelled.value,
-    )
+// 滚动监听（可见页检测 / 当前页码）
+const {
+  currentVisiblePage, getVisiblePages, updateCurrentPage, onScroll,
+  resetCurrentPage, setOnFrame,
+} = useScrollSpy({ containerRef, pageWrapperRefs })
 
-    if (!searchCancelled.value) {
-      Object.assign(searchResult, result)
-      expandedPages.clear()
-      result.pages.forEach((p) => expandedPages.add(p.pageNumber))
+// 渲染队列（消费可见页，驱动 LRU 回收）
+const { scheduleRender, invalidate: invalidateRender, cancel: cancelRender } = useRenderQueue({
+  pdfDoc,
+  scale,
+  canvasRefs,
+  textLayerRefs,
+  annotationLayerRefs,
+  pageWrapperRefs,
+  pageDimensions,
+  recycler,
+  containerRef,
+  getVisiblePages,
+  // 保持与拆分前一致：调度末尾同步一次当前页码
+  onAfterSchedule: updateCurrentPage,
+})
 
-      if (result.totalMatches > 0) {
-        showSearchPanel.value = true
-        currentMatchIndex.value = -1
-        showToast(`找到 ${result.totalMatches} 处匹配`, 'success')
-        refreshHighlights()
-      } else {
-        showToast('未找到匹配内容', 'info')
-      }
-    }
-  } catch (e) {
-    console.error('搜索失败:', e)
-    showToast('搜索失败', 'error')
-  } finally {
-    searching.value = false
-  }
-}
+// 滚动帧 → 调度渲染（打破 scrollSpy 与渲染队列的创建顺序环）
+setOnFrame(scheduleRender)
 
-function clearSearch() {
-  searchCancelled.value = true
-  searching.value = false
-  searchKeyword.value = ''
-  currentMatchIndex.value = -1
-  showSearchPanel.value = false
-  Object.assign(searchResult, {
-    keyword: '',
-    totalMatches: 0,
-    totalPages: 0,
-    pages: [],
-  })
-  expandedPages.clear()
-  clearAllHighlights()
-}
-
-function clearAllHighlights() {
-  highlightVersion++
-  for (const container of highlightLayerRefs.values()) {
-    clearHighlightLayer(container)
-  }
-}
-
-function refreshHighlights() {
-  const ver = ++highlightVersion
-  const matchesByPage = new Map<number, SearchMatch[]>()
-  for (const match of allMatches.value) {
-    if (!matchesByPage.has(match.pageNumber)) {
-      matchesByPage.set(match.pageNumber, [])
-    }
-    matchesByPage.get(match.pageNumber)!.push(match)
-  }
-
-  for (const [pageNum, matches] of matchesByPage) {
-    const container = highlightLayerRefs.get(pageNum)
-    if (!container) continue
-
-    const base = pageBaseDims.get(pageNum)
-    if (!base) continue
-
-    const viewport = {
-      width: base.baseWidth * scale.value,
-      height: base.baseHeight * scale.value,
-      scale: scale.value,
-      rotation: 0,
-      transform: [1, 0, 0, 1, 0, 0],
-      clone: () => ({ /* 简化的 clone，实际高亮层不需要完整 viewport */ }),
-    } as unknown as PdfjsViewport
-
-    let pageCurrentIdx: number | undefined
-    if (currentMatchIndex.value >= 0 && currentMatchIndex.value < allMatches.value.length) {
-      const currentMatch = allMatches.value[currentMatchIndex.value]
-      if (currentMatch && currentMatch.pageNumber === pageNum) {
-        pageCurrentIdx = currentMatch.matchIndex
-      }
-    }
-
-    buildHighlightLayer(container, matches, viewport, pageCurrentIdx)
-  }
-}
-
-function getCurrentMatch(): SearchMatch | null {
-  if (currentMatchIndex.value < 0 || currentMatchIndex.value >= allMatches.value.length) {
-    return null
-  }
-  return allMatches.value[currentMatchIndex.value] || null
-}
-
-function isCurrentMatch(match: SearchMatch): boolean {
-  const current = getCurrentMatch()
-  return current !== null &&
-    current.pageNumber === match.pageNumber &&
-    current.matchIndex === match.matchIndex
-}
-
-function nextMatch() {
-  if (allMatches.value.length === 0) return
-  currentMatchIndex.value = Math.min(
-    currentMatchIndex.value + 1,
-    allMatches.value.length - 1,
-  )
-  const match = getCurrentMatch()
-  if (match) {
-    jumpToMatch(match)
-    refreshHighlights()
-  }
-}
-
-function prevMatch() {
-  if (allMatches.value.length === 0) return
-  currentMatchIndex.value = Math.max(currentMatchIndex.value - 1, 0)
-  const match = getCurrentMatch()
-  if (match) {
-    jumpToMatch(match)
-    refreshHighlights()
-  }
-}
-
-function jumpToMatch(match: SearchMatch) {
-  const idx = allMatches.value.findIndex(
-    (m) => m.pageNumber === match.pageNumber && m.matchIndex === match.matchIndex,
-  )
-  if (idx !== -1) {
-    currentMatchIndex.value = idx
-  }
-
-  const wrapper = pageWrapperRefs.get(match.pageNumber)
-  if (!wrapper || !containerRef.value) return
-
-  const containerTop = containerRef.value.scrollTop
-  const containerHeight = containerRef.value.clientHeight
-  const wrapperTop = wrapper.offsetTop
-  const wrapperHeight = wrapper.offsetHeight
-
-  const matchTop = match.transform[5] * scale.value
-  const targetTop = wrapperTop + matchTop - containerHeight / 2
-
-  containerRef.value.scrollTo({
-    top: targetTop,
-    behavior: 'smooth',
-  })
-
-  refreshHighlights()
-}
-
-function togglePageGroup(pageNumber: number) {
-  if (expandedPages.has(pageNumber)) {
-    expandedPages.delete(pageNumber)
-  } else {
-    expandedPages.add(pageNumber)
-  }
-}
-
-function highlightMatchText(match: SearchMatch, pageText: string): string {
-  const contextLength = 30
-  const start = Math.max(0, match.startOffset - contextLength)
-  const end = Math.min(pageText.length, match.endOffset + contextLength)
-
-  const before = start > 0 ? '...' : ''
-  const after = end < pageText.length ? '...' : ''
-  const prefix = pageText.substring(start, match.startOffset)
-  const matched = pageText.substring(match.startOffset, match.endOffset)
-  const suffix = pageText.substring(match.endOffset, end)
-
-  const escapeHtml = (str: string) => str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-
-  return `${before}${escapeHtml(prefix)}<mark class="search-panel__match-mark">${escapeHtml(matched)}</mark>${escapeHtml(suffix)}${after}`
-}
-
-/* ---- 缩放 ---- */
-function zoomIn() { if (scale.value < 5) scale.value = Math.min(5, +(scale.value + 0.25).toFixed(2)) }
-function zoomOut() { if (scale.value > 0.25) scale.value = Math.max(0.25, +(scale.value - 0.25).toFixed(2)) }
-function fitWidth() {
-  if (!containerRef.value || !pdfDoc.value) return
-  const containerWidth = containerRef.value.clientWidth - 64
-  // 使用第一页的基础宽度（scale=1）计算适合宽度的缩放比
-  const base = pageBaseDims.get(1)
-  if (!base) return
-  scale.value = +(containerWidth / base.baseWidth).toFixed(2)
-}
-
-/* ---- 页面尺寸 ---- */
-function getPageStyle(n: number) {
-  const d = pageDimensions.get(n)
-  return d ? { width: `${d.width}px`, height: `${d.height}px` } : {}
-}
-
-/** 根据 pageBaseDims 和当前 scale 重新计算所有页面的像素尺寸 */
-function recomputeScaledDimensions() {
-  const s = scale.value
-  for (const [n, base] of pageBaseDims) {
-    pageDimensions.set(n, {
-      width: base.baseWidth * s,
-      height: base.baseHeight * s,
-    })
-  }
-}
-
-/**
- * 预计算所有页面的基础尺寸（scale=1）。
- * 逐页获取 viewport，正确处理混合页面大小（纵向/横向/不同尺寸）。
- */
-async function precomputePageDimensions() {
-  const doc = pdfDoc.value
-  if (!doc) return
-  const baseDims = await getPageBaseDimensions(doc)
-  pageBaseDims.clear()
-  for (const [n, dim] of baseDims) {
-    pageBaseDims.set(n, dim)
-  }
-  recomputeScaledDimensions()
-}
-
-/* ---- 页面回收（LRU） ---- */
-function recyclePage(n: number) {
-  const key = `${n}-${scale.value}`
-  if (!renderedPages.has(key)) return
-  const c = canvasRefs.get(n)
-  if (c) { c.width = 0; c.height = 0 }
-  const t = textLayerRefs.get(n)
-  if (t) t.innerHTML = ''
-  const a = annotationLayerRefs.get(n)
-  if (a) a.innerHTML = ''
-  const h = highlightLayerRefs.get(n)
-  if (h) h.innerHTML = ''
-  renderedPages.delete(key)
-  const idx = renderedPageOrder.indexOf(n)
-  if (idx !== -1) renderedPageOrder.splice(idx, 1)
-}
-
-function evictExcess(visible: number[]) {
-  const vs = new Set(visible)
-  while (renderedPageOrder.length > MAX_RENDERED) {
-    const c = renderedPageOrder.find(p => !vs.has(p))
-    if (c === undefined) break
-    recyclePage(c)
-  }
-}
-
-/* ---- 渲染队列 ---- */
-let renderQueue: number[] = []
-let isRendering = false
-
-async function renderPage(n: number, ver: number) {
-  const key = `${n}-${scale.value}`
-  if (renderedPages.has(key) || ver !== renderVersion) return
-  const doc = pdfDoc.value
-  if (!doc) return
-
-  const page: PdfjsPage = await doc.getPage(n)
-  if (ver !== renderVersion) return
-
-  const canvas = canvasRefs.get(n)
-  const textDiv = textLayerRefs.get(n)
-  const annoDiv = annotationLayerRefs.get(n)
-  if (!canvas || !textDiv) return
-
-  const { viewport } = await renderPageToCanvas(page, canvas, scale.value)
-  if (ver !== renderVersion) return
-
-  // 渲染后用实际 viewport 修正尺寸（响应式更新 template）
-  pageDimensions.set(n, { width: viewport.width, height: viewport.height })
-
-  await buildTextLayer(page, textDiv, viewport)
-  if (ver !== renderVersion) return
-
-  if (annoDiv) await buildAnnotationLayer(page, annoDiv, viewport)
-
-  renderedPages.add(key)
-  const idx = renderedPageOrder.indexOf(n)
-  if (idx !== -1) renderedPageOrder.splice(idx, 1)
-  renderedPageOrder.push(n)
-}
-
-async function processQueue() {
-  if (isRendering) return
-  isRendering = true
-  const ver = renderVersion
-  while (renderQueue.length > 0) {
-    if (ver !== renderVersion) break
-    const n = renderQueue.shift()!
-    try { await renderPage(n, ver) } catch (e) { console.error(`渲染第${n}页失败:`, e) }
-  }
-  isRendering = false
-}
-
-/* ---- 可见页面检测 ---- */
-function getVisiblePages(): number[] {
-  const c = containerRef.value
-  if (!c) return []
-  const st = c.scrollTop, sb = st + c.clientHeight, buf = c.clientHeight
-  const vis: number[] = []
-  for (const [n, w] of pageWrapperRefs) {
-    const top = w.offsetTop, bot = top + w.offsetHeight
-    if (bot >= st - buf && top <= sb + buf) vis.push(n)
-  }
-  return vis.sort((a, b) => a - b)
-}
-
-function scheduleRender() {
-  const visible = getVisiblePages()
-  const c = containerRef.value
-  if (c) {
-    const center = c.scrollTop + c.clientHeight / 2
-    visible.sort((a, b) => {
-      const wa = pageWrapperRefs.get(a), wb = pageWrapperRefs.get(b)
-      if (!wa || !wb) return 0
-      return Math.abs(wa.offsetTop + wa.offsetHeight / 2 - center) -
-             Math.abs(wb.offsetTop + wb.offsetHeight / 2 - center)
-    })
-  }
-  renderQueue = visible.filter(p => !renderedPages.has(`${p}-${scale.value}`))
-  evictExcess(visible)
-  if (renderQueue.length > 0) processQueue()
-  updateCurrentPage()
-}
-
-function updateCurrentPage() {
-  const c = containerRef.value
-  if (!c) return
-  const center = c.scrollTop + c.clientHeight / 2
-  let closest = 1, minD = Infinity
-  for (const [n, w] of pageWrapperRefs) {
-    const d = Math.abs(w.offsetTop + w.offsetHeight / 2 - center)
-    if (d < minD) { minD = d; closest = n }
-  }
-  currentVisiblePage.value = closest
-}
-
-function onScroll() {
-  if (scrollRafId) return
-  scrollRafId = requestAnimationFrame(() => {
-    scrollRafId = null
-    updateCurrentPage()
-    scheduleRender()
-  })
-}
-
-/* ---- 缩放 watcher ---- */
+/* ---- 缩放 watcher：跨模块编排（布局重算 → 作废渲染 → 重渲染 → 高亮重建） ---- */
 watch(scale, async () => {
   if (!pdfDoc.value) return
-  renderVersion++; renderQueue = []
-  renderedPages.clear(); renderedPageOrder.length = 0
+  invalidateRender(); recycler.clear()
   recomputeScaledDimensions()
   await nextTick()
   scheduleRender()
@@ -661,31 +296,16 @@ watch(scale, async () => {
 /* ---- 加载 PDF ---- */
 async function loadPdf(url: string) {
   loading.value = true; errorMsg.value = ''
-  renderVersion++; renderQueue = []
-  renderedPages.clear(); renderedPageOrder.length = 0
-  pageDimensions.clear(); pageBaseDims.clear()
-  canvasRefs.clear(); textLayerRefs.clear()
-  annotationLayerRefs.clear(); highlightLayerRefs.clear()
-  pageWrapperRefs.clear()
+  invalidateRender(); recycler.clear()
+  resetLayout(); resetRegistry()
 
-  searchCancelled.value = true
-  searching.value = false
-  searchKeyword.value = ''
-  currentMatchIndex.value = -1
-  showSearchPanel.value = false
-  Object.assign(searchResult, {
-    keyword: '',
-    totalMatches: 0,
-    totalPages: 0,
-    pages: [],
-  })
-  expandedPages.clear()
+  resetSearch()
 
   try {
     const doc = await loadPdfDocument(url)
     pdfDoc.value = doc
     totalPages.value = doc.numPages
-    currentVisiblePage.value = 1
+    resetCurrentPage()
     await precomputePageDimensions()
     loading.value = false
     showToast(`加载成功，共 ${doc.numPages} 页`, 'success')
@@ -732,288 +352,10 @@ onUnmounted(() => {
   document.removeEventListener('dragover', onDragOver)
   document.removeEventListener('drop', onDrop)
   if (toastTimer) clearTimeout(toastTimer)
-  if (scrollRafId) cancelAnimationFrame(scrollRafId)
   searchCancelled.value = true
-  renderVersion++
+  cancelRender()
   pdfDoc.value?.destroy()
 })
 </script>
 
-<style lang="scss">
-.textLayer {
-  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-  overflow: hidden; opacity: 0.25; line-height: 1;
-  text-size-adjust: none; forced-color-adjust: none; z-index: 2;
-  ::selection { background: rgba(22,119,255,0.3); }
-  br { &::selection { background: transparent; } }
-  span, br {
-    color: transparent; position: absolute; white-space: pre;
-    cursor: text; transform-origin: 0% 0%;
-  }
-  span::selection { background: rgba(22,119,255,0.4); color: transparent; }
-  .endOfContent {
-    display: block; position: absolute; left: 0; top: 100%; right: 0; bottom: 0;
-    z-index: -1; cursor: default; user-select: none;
-    &.active { top: 0; }
-  }
-}
-.annotationLayer {
-  position: absolute; top: 0; left: 0; z-index: 3; pointer-events: none;
-  section { position: absolute; pointer-events: auto; }
-  a { color: var(--primary-color); &:hover { opacity: 0.8; } }
-}
-.search-highlight {
-  position: absolute;
-  background: rgba(255, 235, 59, 0.55);
-  border-radius: 2px;
-  pointer-events: none;
-  transition: background 0.2s;
-  &--active {
-    background: rgba(255, 152, 0, 0.7);
-    box-shadow: 0 0 0 2px rgba(255, 152, 0, 0.4);
-  }
-}
-</style>
-
-<style lang="scss" scoped>
-.pdf-viewer { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
-
-.toolbar {
-  display: flex; align-items: center; justify-content: space-between;
-  height: 56px; padding: 0 16px; background: var(--card-bg);
-  border-bottom: 1px solid var(--border-color); box-shadow: var(--shadow-sm);
-  flex-shrink: 0; z-index: 10; gap: 8px;
-  &__left, &__center, &__right { display: flex; align-items: center; gap: 8px; }
-  &__left { flex: 1; flex-wrap: wrap; }
-  &__right { flex-shrink: 0; }
-  &__sample-btn {
-    padding: 4px 12px; border: 1px solid var(--border-color); border-radius: var(--radius-sm);
-    background: var(--card-bg); color: var(--text-secondary); cursor: pointer;
-    font-size: var(--font-size-sm); transition: all 0.2s; white-space: nowrap;
-    &:hover:not(:disabled) { border-color: var(--primary-color); color: var(--primary-color); }
-    &--active { border-color: var(--primary-color); color: var(--primary-color); background: #e6f4ff; }
-    &:disabled { opacity: 0.5; cursor: not-allowed; }
-  }
-  &__divider { width: 1px; height: 24px; background: var(--border-color); }
-  &__info { font-size: var(--font-size-sm); color: var(--text-secondary); white-space: nowrap; }
-  &__btn {
-    display: flex; align-items: center; justify-content: center;
-    width: 34px; height: 34px; border: 1px solid var(--border-color);
-    border-radius: var(--radius-sm); background: var(--card-bg);
-    color: var(--text-primary); cursor: pointer; transition: all 0.2s;
-    &:hover:not(:disabled) { border-color: var(--primary-color); color: var(--primary-color); }
-    &:disabled { opacity: 0.4; cursor: not-allowed; }
-  }
-  &__zoom-value {
-    font-size: var(--font-size-sm); color: var(--text-secondary);
-    min-width: 44px; text-align: center; font-variant-numeric: tabular-nums;
-  }
-  &__hint { font-size: var(--font-size-sm); color: var(--text-tertiary); }
-}
-
-.pdf-container { flex: 1; overflow: auto; background: var(--bg-color); will-change: scroll-position; }
-.pdf-pages { display: flex; flex-direction: column; align-items: center; padding: 24px 0; gap: 16px; contain: layout style; }
-.pdf-page-wrapper { display: flex; flex-direction: column; align-items: center; gap: 4px; contain: layout style; }
-.pdf-page {
-  position: relative; background: #fff; box-shadow: var(--shadow-md);
-  border-radius: 2px; overflow: hidden; will-change: contents;
-  canvas { display: block; }
-}
-.pdf-page__number { font-size: var(--font-size-sm); color: var(--text-tertiary); }
-
-.pdf-empty {
-  display: flex; align-items: center; justify-content: center; height: 100%; padding: 48px;
-  &__card {
-    display: flex; flex-direction: column; align-items: center; gap: 16px;
-    padding: 48px 64px; background: var(--card-bg); border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-md); border: 2px dashed var(--border-color); text-align: center;
-    &--clickable { cursor: pointer; transition: all 0.2s;
-      &:hover { border-color: var(--primary-color); box-shadow: var(--shadow-lg); }
-    }
-  }
-  &__input { display: none; }
-  &__icon { width: 64px; height: 64px; opacity: 0.6; }
-  &__text { font-size: var(--font-size-lg); color: var(--text-primary); }
-  &__sub { font-size: var(--font-size-sm); color: var(--text-tertiary); }
-}
-.pdf-loading {
-  display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 16px;
-  &__spinner {
-    width: 40px; height: 40px; border: 3px solid var(--border-color);
-    border-top-color: var(--primary-color); border-radius: 50%; animation: spin 0.8s linear infinite;
-  }
-  &__text { color: var(--text-secondary); }
-}
-@keyframes spin { to { transform: rotate(360deg); } }
-.pdf-error {
-  display: flex; align-items: center; justify-content: center; padding: 48px;
-  &__card {
-    display: flex; flex-direction: column; align-items: center; gap: 16px;
-    padding: 32px 48px; background: #fff2f0; border: 1px solid #ffccc7; border-radius: var(--radius-md);
-  }
-  &__text { color: #cf1322; }
-  &__btn {
-    padding: 6px 24px; background: var(--card-bg); border: 1px solid var(--border-color);
-    border-radius: var(--radius-sm); cursor: pointer; transition: all 0.2s;
-    &:hover { border-color: var(--primary-color); color: var(--primary-color); }
-  }
-}
-.toast {
-  position: fixed; top: 72px; left: 50%; transform: translateX(-50%);
-  padding: 10px 24px; border-radius: var(--radius-md); box-shadow: var(--shadow-lg);
-  z-index: 1000; pointer-events: none;
-  &--success { background: #f6ffed; border: 1px solid #b7eb8f; color: #389e0d; }
-  &--error { background: #fff2f0; border: 1px solid #ffccc7; color: #cf1322; }
-  &--info { background: #e6f4ff; border: 1px solid #91caff; color: #0958d9; }
-}
-.toast-enter-active, .toast-leave-active { transition: all 0.3s ease; }
-.toast-enter-from, .toast-leave-to { opacity: 0; transform: translateX(-50%) translateY(-12px); }
-
-/* ---- 主区域布局 ---- */
-.pdf-main { display: flex; flex: 1; overflow: hidden; }
-
-/* ---- 工具栏搜索 ---- */
-.toolbar {
-  &__search {
-    display: flex; align-items: center;
-    height: 34px; padding: 0 8px;
-    border: 1px solid var(--border-color); border-radius: var(--radius-sm);
-    background: var(--card-bg);
-    transition: border-color 0.2s;
-    &:focus-within { border-color: var(--primary-color); }
-    &-icon { color: var(--text-tertiary); flex-shrink: 0; }
-    &-input {
-      flex: 1; height: 100%;
-      border: none; outline: none; background: transparent;
-      padding: 0 8px; font-size: var(--font-size-sm);
-      color: var(--text-primary);
-      &::placeholder { color: var(--text-tertiary); }
-      &:disabled { opacity: 0.5; cursor: not-allowed; }
-    }
-    &-clear {
-      display: flex; align-items: center; justify-content: center;
-      width: 18px; height: 18px;
-      border: none; background: transparent;
-      color: var(--text-tertiary); cursor: pointer;
-      border-radius: 50%; transition: all 0.2s;
-      &:hover:not(:disabled) { background: var(--border-color); color: var(--text-primary); }
-      &:disabled { opacity: 0.5; cursor: not-allowed; }
-    }
-    &-btn {
-      margin-left: 4px;
-      width: 30px !important; height: 30px !important;
-    }
-    &-spinner {
-      width: 14px; height: 14px;
-      border: 2px solid var(--border-color);
-      border-top-color: var(--primary-color);
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-    }
-  }
-  &__search-count {
-    font-size: var(--font-size-sm); color: var(--text-secondary);
-    font-variant-numeric: tabular-nums;
-    min-width: 56px; text-align: center;
-  }
-}
-
-/* ---- 搜索面板 ---- */
-.search-panel {
-  width: 320px; flex-shrink: 0;
-  background: var(--card-bg);
-  border-right: 1px solid var(--border-color);
-  display: flex; flex-direction: column;
-  &__header {
-    display: flex; align-items: center; gap: 8px;
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--border-color);
-    flex-shrink: 0;
-  }
-  &__title { font-weight: 600; color: var(--text-primary); flex: 1; }
-  &__count { font-size: var(--font-size-sm); color: var(--text-secondary); }
-  &__close {
-    display: flex; align-items: center; justify-content: center;
-    width: 24px; height: 24px;
-    border: none; background: transparent;
-    color: var(--text-tertiary); cursor: pointer;
-    border-radius: var(--radius-sm); transition: all 0.2s;
-    &:hover { background: var(--bg-color); color: var(--text-primary); }
-  }
-  &__content {
-    flex: 1; overflow-y: auto;
-    padding: 8px 0;
-  }
-  &__page-group {
-    margin-bottom: 4px;
-  }
-  &__page-header {
-    display: flex; align-items: center; gap: 8px;
-    padding: 8px 16px;
-    cursor: pointer;
-    transition: background 0.2s;
-    &:hover { background: var(--bg-color); }
-  }
-  &__expand-icon {
-    transition: transform 0.2s;
-    color: var(--text-tertiary);
-    &--expanded { transform: rotate(90deg); }
-  }
-  &__page-title {
-    flex: 1; font-size: var(--font-size-sm); font-weight: 500;
-    color: var(--text-primary);
-  }
-  &__page-count {
-    font-size: var(--font-size-sm); color: var(--text-tertiary);
-    background: var(--bg-color);
-    padding: 2px 8px; border-radius: 10px;
-  }
-  &__matches {
-    padding: 4px 0;
-  }
-  &__match {
-    padding: 8px 16px 8px 36px;
-    cursor: pointer;
-    transition: background 0.2s;
-    border-left: 2px solid transparent;
-    &:hover { background: var(--bg-color); }
-    &--active {
-      background: #e6f4ff;
-      border-left-color: var(--primary-color);
-    }
-  }
-  &__match-text {
-    font-size: var(--font-size-sm);
-    color: var(--text-secondary);
-    line-height: 1.5;
-    word-break: break-word;
-  }
-  &__match-mark {
-    background: rgba(255, 235, 59, 0.6);
-    color: var(--text-primary);
-    padding: 0 2px; border-radius: 2px;
-    font-weight: 500;
-  }
-}
-
-/* ---- 搜索中状态 ---- */
-.pdf-searching {
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
-  height: 100%; gap: 12px;
-  &__spinner {
-    width: 36px; height: 36px;
-    border: 3px solid var(--border-color);
-    border-top-color: var(--primary-color);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-  }
-  &__text { color: var(--text-secondary); font-weight: 500; }
-  &__progress { color: var(--text-tertiary); font-size: var(--font-size-sm); }
-}
-
-/* ---- 高亮层 ---- */
-.pdf-page__highlight-layer {
-  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-  pointer-events: none; z-index: 4;
-}
-</style>
+<style lang="scss" src="@/styles/pdf-viewer.scss" scoped></style>

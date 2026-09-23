@@ -1,0 +1,41 @@
+/**
+ * PDF 渲染层全局样式
+ *
+ * textLayer / annotationLayer 的节点由 PDF.js 动态生成，
+ * 必须使用全局样式（不能 scoped），且需与 PdfViewer 的 scoped
+ * 样式一起加载，故单独成文件、由 main.ts 引入。
+ */
+
+.textLayer {
+  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+  overflow: hidden; opacity: 0.25; line-height: 1;
+  text-size-adjust: none; forced-color-adjust: none; z-index: 2;
+  ::selection { background: rgba(22,119,255,0.3); }
+  br { &::selection { background: transparent; } }
+  span, br {
+    color: transparent; position: absolute; white-space: pre;
+    cursor: text; transform-origin: 0% 0%;
+  }
+  span::selection { background: rgba(22,119,255,0.4); color: transparent; }
+  .endOfContent {
+    display: block; position: absolute; left: 0; top: 100%; right: 0; bottom: 0;
+    z-index: -1; cursor: default; user-select: none;
+    &.active { top: 0; }
+  }
+}
+.annotationLayer {
+  position: absolute; top: 0; left: 0; z-index: 3; pointer-events: none;
+  section { position: absolute; pointer-events: auto; }
+  a { color: var(--primary-color); &:hover { opacity: 0.8; } }
+}
+.search-highlight {
+  position: absolute;
+  background: rgba(255, 235, 59, 0.55);
+  border-radius: 2px;
+  pointer-events: none;
+  transition: background 0.2s;
+  &--active {
+    background: rgba(255, 152, 0, 0.7);
+    box-shadow: 0 0 0 2px rgba(255, 152, 0, 0.4);
+  }
+}
