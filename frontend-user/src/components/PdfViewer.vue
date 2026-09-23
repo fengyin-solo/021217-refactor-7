@@ -183,14 +183,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
-import {
-  loadPdfDocument, renderPageToCanvas, buildTextLayer,
-  buildAnnotationLayer, preloadPdfjs, getPageBaseDimensions,
-  searchDocument, buildHighlightLayer, clearHighlightLayer,
-  type PdfjsDocument, type PdfjsPage, type PdfjsViewport,
-  type SearchResult, type SearchMatch, type PageSearchResult,
-} from '@/utils/pdf-engine'
+import { ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { loadPdfDocument, preloadPdfjs, type PdfjsDocument } from '@/utils/pdf-engine'
+import { useToast } from '@/composables/useToast'
+import { usePageElements } from '@/composables/usePageElements'
+import { usePageLayout } from '@/composables/usePageLayout'
+import { usePageRenderer } from '@/composables/usePageRenderer'
+import { useScrollObserver } from '@/composables/useScrollObserver'
+import { usePdfSearch } from '@/composables/usePdfSearch'
 
 const sampleFiles = [
   { name: 'sample.pdf', label: '示例一：学术论文' },
@@ -198,283 +198,56 @@ const sampleFiles = [
   { name: 'document.pdf', label: '示例三：图文混排' },
 ]
 
-/* ---- 响应式状态 ---- */
+/* ---- 文档级响应式状态 ---- */
 const pdfDoc = ref<PdfjsDocument | null>(null)
 const totalPages = ref(0)
 const scale = ref(1.5)
 const loading = ref(false)
 const errorMsg = ref('')
 const fileName = ref('')
-const currentVisiblePage = ref(1)
-const toastMsg = ref('')
-const toastType = ref<'success' | 'error' | 'info'>('info')
 
 const containerRef = ref<HTMLElement | null>(null)
 const searchInputRef = ref<HTMLInputElement | null>(null)
 
-/* ---- 搜索相关状态 ---- */
-const searchKeyword = ref('')
-const searching = ref(false)
-const searchCancelled = ref(false)
-const searchProgress = reactive({ current: 0, total: 0 })
-const searchResult = reactive<SearchResult>({
-  keyword: '',
-  totalMatches: 0,
-  totalPages: 0,
-  pages: [],
+/* ---- 按职责组合：Toast / 元素引用 / 布局尺寸 / 渲染回收 / 滚动检测 / 查找高亮 ---- */
+const { toastMsg, toastType, showToast } = useToast()
+
+const pageElements = usePageElements()
+const {
+  setCanvasRef, setTextLayerRef, setAnnotationLayerRef, setHighlightLayerRef, setPageRef,
+} = pageElements
+
+const pageLayout = usePageLayout()
+const { pageBaseDims, getPageStyle } = pageLayout
+
+const pageRenderer = usePageRenderer({
+  getDoc: () => pdfDoc.value,
+  getScale: () => scale.value,
+  elements: pageElements,
+  layout: pageLayout,
 })
-const currentMatchIndex = ref(-1)
-const showSearchPanel = ref(false)
-const expandedPages = reactive(new Set<number>())
-const allMatches = computed<SearchMatch[]>(() => {
-  return searchResult.pages.flatMap((p) => p.matches)
+
+const { currentVisiblePage, onScroll, check: checkViewport, reset: resetScroll, dispose: disposeScroll } =
+  useScrollObserver({
+    containerRef,
+    elements: pageElements,
+    onScheduleRender: (visibleSorted) => pageRenderer.requestRender(visibleSorted),
+  })
+
+const {
+  searchKeyword, searching, searchProgress, searchResult, currentMatchIndex,
+  showSearchPanel, expandedPages,
+  startSearch, clearSearch, refreshHighlights, isCurrentMatch,
+  nextMatch, prevMatch, jumpToMatch, togglePageGroup, highlightMatchText,
+  reset: resetSearch, dispose: disposeSearch,
+} = usePdfSearch({
+  getDoc: () => pdfDoc.value,
+  getScale: () => scale.value,
+  containerRef,
+  elements: pageElements,
+  layout: pageLayout,
+  showToast,
 })
-
-/**
- * 每页的基础尺寸（scale=1 时的宽高），用于精确计算不同尺寸页面的布局。
- * 使用 reactive(Map) 确保 set/delete 操作触发视图更新。
- */
-const pageBaseDims = reactive(new Map<number, { baseWidth: number; baseHeight: number }>())
-
-/**
- * 每页在当前 scale 下的实际像素尺寸（响应式）。
- * getPageStyle() 依赖此 Map 驱动 template 中 .pdf-page 的宽高。
- */
-const pageDimensions = reactive(new Map<number, { width: number; height: number }>())
-
-/* ---- 非响应式内部状态（不驱动 template，无需 reactive） ---- */
-const canvasRefs = new Map<number, HTMLCanvasElement>()
-const textLayerRefs = new Map<number, HTMLDivElement>()
-const annotationLayerRefs = new Map<number, HTMLDivElement>()
-const highlightLayerRefs = new Map<number, HTMLDivElement>()
-const pageWrapperRefs = new Map<number, HTMLElement>()
-const renderedPages = new Set<string>()
-const renderedPageOrder: number[] = []
-const MAX_RENDERED = 15
-let toastTimer: ReturnType<typeof setTimeout> | null = null
-let renderVersion = 0
-let scrollRafId: number | null = null
-let highlightVersion = 0
-
-/* ---- Ref 绑定 ---- */
-function setCanvasRef(el: HTMLCanvasElement | null, n: number) { if (el) canvasRefs.set(n, el) }
-function setTextLayerRef(el: HTMLDivElement | null, n: number) { if (el) textLayerRefs.set(n, el) }
-function setAnnotationLayerRef(el: HTMLDivElement | null, n: number) { if (el) annotationLayerRefs.set(n, el) }
-function setHighlightLayerRef(el: HTMLDivElement | null, n: number) { if (el) highlightLayerRefs.set(n, el) }
-function setPageRef(el: HTMLElement | null, n: number) { if (el) pageWrapperRefs.set(n, el) }
-
-/* ---- Toast ---- */
-function showToast(msg: string, type: 'success' | 'error' | 'info' = 'info') {
-  toastMsg.value = msg; toastType.value = type
-  if (toastTimer) clearTimeout(toastTimer)
-  toastTimer = setTimeout(() => { toastMsg.value = '' }, 3000)
-}
-
-/* ---- 搜索功能 ---- */
-async function startSearch() {
-  const keyword = searchKeyword.value.trim()
-  if (!keyword || !pdfDoc.value) return
-
-  searching.value = true
-  searchCancelled.value = false
-  searchProgress.current = 0
-  searchProgress.total = pdfDoc.value.numPages
-  currentMatchIndex.value = -1
-
-  Object.assign(searchResult, {
-    keyword,
-    totalMatches: 0,
-    totalPages: pdfDoc.value.numPages,
-    pages: [],
-  })
-
-  clearAllHighlights()
-
-  try {
-    const result = await searchDocument(
-      pdfDoc.value,
-      keyword,
-      false,
-      (page, total) => {
-        searchProgress.current = page
-        searchProgress.total = total
-      },
-      () => searchCancelled.value,
-    )
-
-    if (!searchCancelled.value) {
-      Object.assign(searchResult, result)
-      expandedPages.clear()
-      result.pages.forEach((p) => expandedPages.add(p.pageNumber))
-
-      if (result.totalMatches > 0) {
-        showSearchPanel.value = true
-        currentMatchIndex.value = -1
-        showToast(`找到 ${result.totalMatches} 处匹配`, 'success')
-        refreshHighlights()
-      } else {
-        showToast('未找到匹配内容', 'info')
-      }
-    }
-  } catch (e) {
-    console.error('搜索失败:', e)
-    showToast('搜索失败', 'error')
-  } finally {
-    searching.value = false
-  }
-}
-
-function clearSearch() {
-  searchCancelled.value = true
-  searching.value = false
-  searchKeyword.value = ''
-  currentMatchIndex.value = -1
-  showSearchPanel.value = false
-  Object.assign(searchResult, {
-    keyword: '',
-    totalMatches: 0,
-    totalPages: 0,
-    pages: [],
-  })
-  expandedPages.clear()
-  clearAllHighlights()
-}
-
-function clearAllHighlights() {
-  highlightVersion++
-  for (const container of highlightLayerRefs.values()) {
-    clearHighlightLayer(container)
-  }
-}
-
-function refreshHighlights() {
-  const ver = ++highlightVersion
-  const matchesByPage = new Map<number, SearchMatch[]>()
-  for (const match of allMatches.value) {
-    if (!matchesByPage.has(match.pageNumber)) {
-      matchesByPage.set(match.pageNumber, [])
-    }
-    matchesByPage.get(match.pageNumber)!.push(match)
-  }
-
-  for (const [pageNum, matches] of matchesByPage) {
-    const container = highlightLayerRefs.get(pageNum)
-    if (!container) continue
-
-    const base = pageBaseDims.get(pageNum)
-    if (!base) continue
-
-    const viewport = {
-      width: base.baseWidth * scale.value,
-      height: base.baseHeight * scale.value,
-      scale: scale.value,
-      rotation: 0,
-      transform: [1, 0, 0, 1, 0, 0],
-      clone: () => ({ /* 简化的 clone，实际高亮层不需要完整 viewport */ }),
-    } as unknown as PdfjsViewport
-
-    let pageCurrentIdx: number | undefined
-    if (currentMatchIndex.value >= 0 && currentMatchIndex.value < allMatches.value.length) {
-      const currentMatch = allMatches.value[currentMatchIndex.value]
-      if (currentMatch && currentMatch.pageNumber === pageNum) {
-        pageCurrentIdx = currentMatch.matchIndex
-      }
-    }
-
-    buildHighlightLayer(container, matches, viewport, pageCurrentIdx)
-  }
-}
-
-function getCurrentMatch(): SearchMatch | null {
-  if (currentMatchIndex.value < 0 || currentMatchIndex.value >= allMatches.value.length) {
-    return null
-  }
-  return allMatches.value[currentMatchIndex.value] || null
-}
-
-function isCurrentMatch(match: SearchMatch): boolean {
-  const current = getCurrentMatch()
-  return current !== null &&
-    current.pageNumber === match.pageNumber &&
-    current.matchIndex === match.matchIndex
-}
-
-function nextMatch() {
-  if (allMatches.value.length === 0) return
-  currentMatchIndex.value = Math.min(
-    currentMatchIndex.value + 1,
-    allMatches.value.length - 1,
-  )
-  const match = getCurrentMatch()
-  if (match) {
-    jumpToMatch(match)
-    refreshHighlights()
-  }
-}
-
-function prevMatch() {
-  if (allMatches.value.length === 0) return
-  currentMatchIndex.value = Math.max(currentMatchIndex.value - 1, 0)
-  const match = getCurrentMatch()
-  if (match) {
-    jumpToMatch(match)
-    refreshHighlights()
-  }
-}
-
-function jumpToMatch(match: SearchMatch) {
-  const idx = allMatches.value.findIndex(
-    (m) => m.pageNumber === match.pageNumber && m.matchIndex === match.matchIndex,
-  )
-  if (idx !== -1) {
-    currentMatchIndex.value = idx
-  }
-
-  const wrapper = pageWrapperRefs.get(match.pageNumber)
-  if (!wrapper || !containerRef.value) return
-
-  const containerTop = containerRef.value.scrollTop
-  const containerHeight = containerRef.value.clientHeight
-  const wrapperTop = wrapper.offsetTop
-  const wrapperHeight = wrapper.offsetHeight
-
-  const matchTop = match.transform[5] * scale.value
-  const targetTop = wrapperTop + matchTop - containerHeight / 2
-
-  containerRef.value.scrollTo({
-    top: targetTop,
-    behavior: 'smooth',
-  })
-
-  refreshHighlights()
-}
-
-function togglePageGroup(pageNumber: number) {
-  if (expandedPages.has(pageNumber)) {
-    expandedPages.delete(pageNumber)
-  } else {
-    expandedPages.add(pageNumber)
-  }
-}
-
-function highlightMatchText(match: SearchMatch, pageText: string): string {
-  const contextLength = 30
-  const start = Math.max(0, match.startOffset - contextLength)
-  const end = Math.min(pageText.length, match.endOffset + contextLength)
-
-  const before = start > 0 ? '...' : ''
-  const after = end < pageText.length ? '...' : ''
-  const prefix = pageText.substring(start, match.startOffset)
-  const matched = pageText.substring(match.startOffset, match.endOffset)
-  const suffix = pageText.substring(match.endOffset, end)
-
-  const escapeHtml = (str: string) => str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-
-  return `${before}${escapeHtml(prefix)}<mark class="search-panel__match-mark">${escapeHtml(matched)}</mark>${escapeHtml(suffix)}${after}`
-}
 
 /* ---- 缩放 ---- */
 function zoomIn() { if (scale.value < 5) scale.value = Math.min(5, +(scale.value + 0.25).toFixed(2)) }
@@ -488,171 +261,13 @@ function fitWidth() {
   scale.value = +(containerWidth / base.baseWidth).toFixed(2)
 }
 
-/* ---- 页面尺寸 ---- */
-function getPageStyle(n: number) {
-  const d = pageDimensions.get(n)
-  return d ? { width: `${d.width}px`, height: `${d.height}px` } : {}
-}
-
-/** 根据 pageBaseDims 和当前 scale 重新计算所有页面的像素尺寸 */
-function recomputeScaledDimensions() {
-  const s = scale.value
-  for (const [n, base] of pageBaseDims) {
-    pageDimensions.set(n, {
-      width: base.baseWidth * s,
-      height: base.baseHeight * s,
-    })
-  }
-}
-
-/**
- * 预计算所有页面的基础尺寸（scale=1）。
- * 逐页获取 viewport，正确处理混合页面大小（纵向/横向/不同尺寸）。
- */
-async function precomputePageDimensions() {
-  const doc = pdfDoc.value
-  if (!doc) return
-  const baseDims = await getPageBaseDimensions(doc)
-  pageBaseDims.clear()
-  for (const [n, dim] of baseDims) {
-    pageBaseDims.set(n, dim)
-  }
-  recomputeScaledDimensions()
-}
-
-/* ---- 页面回收（LRU） ---- */
-function recyclePage(n: number) {
-  const key = `${n}-${scale.value}`
-  if (!renderedPages.has(key)) return
-  const c = canvasRefs.get(n)
-  if (c) { c.width = 0; c.height = 0 }
-  const t = textLayerRefs.get(n)
-  if (t) t.innerHTML = ''
-  const a = annotationLayerRefs.get(n)
-  if (a) a.innerHTML = ''
-  const h = highlightLayerRefs.get(n)
-  if (h) h.innerHTML = ''
-  renderedPages.delete(key)
-  const idx = renderedPageOrder.indexOf(n)
-  if (idx !== -1) renderedPageOrder.splice(idx, 1)
-}
-
-function evictExcess(visible: number[]) {
-  const vs = new Set(visible)
-  while (renderedPageOrder.length > MAX_RENDERED) {
-    const c = renderedPageOrder.find(p => !vs.has(p))
-    if (c === undefined) break
-    recyclePage(c)
-  }
-}
-
-/* ---- 渲染队列 ---- */
-let renderQueue: number[] = []
-let isRendering = false
-
-async function renderPage(n: number, ver: number) {
-  const key = `${n}-${scale.value}`
-  if (renderedPages.has(key) || ver !== renderVersion) return
-  const doc = pdfDoc.value
-  if (!doc) return
-
-  const page: PdfjsPage = await doc.getPage(n)
-  if (ver !== renderVersion) return
-
-  const canvas = canvasRefs.get(n)
-  const textDiv = textLayerRefs.get(n)
-  const annoDiv = annotationLayerRefs.get(n)
-  if (!canvas || !textDiv) return
-
-  const { viewport } = await renderPageToCanvas(page, canvas, scale.value)
-  if (ver !== renderVersion) return
-
-  // 渲染后用实际 viewport 修正尺寸（响应式更新 template）
-  pageDimensions.set(n, { width: viewport.width, height: viewport.height })
-
-  await buildTextLayer(page, textDiv, viewport)
-  if (ver !== renderVersion) return
-
-  if (annoDiv) await buildAnnotationLayer(page, annoDiv, viewport)
-
-  renderedPages.add(key)
-  const idx = renderedPageOrder.indexOf(n)
-  if (idx !== -1) renderedPageOrder.splice(idx, 1)
-  renderedPageOrder.push(n)
-}
-
-async function processQueue() {
-  if (isRendering) return
-  isRendering = true
-  const ver = renderVersion
-  while (renderQueue.length > 0) {
-    if (ver !== renderVersion) break
-    const n = renderQueue.shift()!
-    try { await renderPage(n, ver) } catch (e) { console.error(`渲染第${n}页失败:`, e) }
-  }
-  isRendering = false
-}
-
-/* ---- 可见页面检测 ---- */
-function getVisiblePages(): number[] {
-  const c = containerRef.value
-  if (!c) return []
-  const st = c.scrollTop, sb = st + c.clientHeight, buf = c.clientHeight
-  const vis: number[] = []
-  for (const [n, w] of pageWrapperRefs) {
-    const top = w.offsetTop, bot = top + w.offsetHeight
-    if (bot >= st - buf && top <= sb + buf) vis.push(n)
-  }
-  return vis.sort((a, b) => a - b)
-}
-
-function scheduleRender() {
-  const visible = getVisiblePages()
-  const c = containerRef.value
-  if (c) {
-    const center = c.scrollTop + c.clientHeight / 2
-    visible.sort((a, b) => {
-      const wa = pageWrapperRefs.get(a), wb = pageWrapperRefs.get(b)
-      if (!wa || !wb) return 0
-      return Math.abs(wa.offsetTop + wa.offsetHeight / 2 - center) -
-             Math.abs(wb.offsetTop + wb.offsetHeight / 2 - center)
-    })
-  }
-  renderQueue = visible.filter(p => !renderedPages.has(`${p}-${scale.value}`))
-  evictExcess(visible)
-  if (renderQueue.length > 0) processQueue()
-  updateCurrentPage()
-}
-
-function updateCurrentPage() {
-  const c = containerRef.value
-  if (!c) return
-  const center = c.scrollTop + c.clientHeight / 2
-  let closest = 1, minD = Infinity
-  for (const [n, w] of pageWrapperRefs) {
-    const d = Math.abs(w.offsetTop + w.offsetHeight / 2 - center)
-    if (d < minD) { minD = d; closest = n }
-  }
-  currentVisiblePage.value = closest
-}
-
-function onScroll() {
-  if (scrollRafId) return
-  scrollRafId = requestAnimationFrame(() => {
-    scrollRafId = null
-    updateCurrentPage()
-    scheduleRender()
-  })
-}
-
-/* ---- 缩放 watcher ---- */
+/* ---- 缩放：作废当前渲染批次 → 重算尺寸 → 重新调度 → 重建高亮 ---- */
 watch(scale, async () => {
   if (!pdfDoc.value) return
-  renderVersion++; renderQueue = []
-  renderedPages.clear(); renderedPageOrder.length = 0
-  recomputeScaledDimensions()
+  pageRenderer.invalidate()
+  pageLayout.recomputeScaledDimensions(scale.value)
   await nextTick()
-  scheduleRender()
+  checkViewport()
   if (searchResult.totalMatches > 0) {
     refreshHighlights()
   }
@@ -661,36 +276,22 @@ watch(scale, async () => {
 /* ---- 加载 PDF ---- */
 async function loadPdf(url: string) {
   loading.value = true; errorMsg.value = ''
-  renderVersion++; renderQueue = []
-  renderedPages.clear(); renderedPageOrder.length = 0
-  pageDimensions.clear(); pageBaseDims.clear()
-  canvasRefs.clear(); textLayerRefs.clear()
-  annotationLayerRefs.clear(); highlightLayerRefs.clear()
-  pageWrapperRefs.clear()
-
-  searchCancelled.value = true
-  searching.value = false
-  searchKeyword.value = ''
-  currentMatchIndex.value = -1
-  showSearchPanel.value = false
-  Object.assign(searchResult, {
-    keyword: '',
-    totalMatches: 0,
-    totalPages: 0,
-    pages: [],
-  })
-  expandedPages.clear()
+  pageRenderer.invalidate()
+  pageLayout.reset()
+  pageElements.reset()
+  resetSearch()
+  resetScroll()
 
   try {
     const doc = await loadPdfDocument(url)
     pdfDoc.value = doc
     totalPages.value = doc.numPages
-    currentVisiblePage.value = 1
-    await precomputePageDimensions()
+    await pageLayout.precomputePageDimensions(doc)
+    pageLayout.recomputeScaledDimensions(scale.value)
     loading.value = false
     showToast(`加载成功，共 ${doc.numPages} 页`, 'success')
     await nextTick()
-    setTimeout(scheduleRender, 50)
+    setTimeout(checkViewport, 50)
   } catch (e: unknown) {
     loading.value = false
     const msg = e instanceof Error ? e.message : String(e)
@@ -731,10 +332,9 @@ onMounted(() => {
 onUnmounted(() => {
   document.removeEventListener('dragover', onDragOver)
   document.removeEventListener('drop', onDrop)
-  if (toastTimer) clearTimeout(toastTimer)
-  if (scrollRafId) cancelAnimationFrame(scrollRafId)
-  searchCancelled.value = true
-  renderVersion++
+  disposeScroll()
+  disposeSearch()
+  pageRenderer.dispose()
   pdfDoc.value?.destroy()
 })
 </script>
